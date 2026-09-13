@@ -1,0 +1,205 @@
+name: Sync upstream branches to fork and Codeberg
+
+on:
+  schedule:
+    - cron: '0 0,5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-openmetadata
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REMOTE: https://github.com/open-metadata/OpenMetadata.git
+  CODEBERG_REMOTE: https://codeberg.org/DNDC/OpenMetadata.git
+
+  MIN_VERSION: '1.13.0'
+  VERSION_BRANCH_REGEX: '^[1-9][0-9]*\.[0-9]+\.[0-9]+$'
+  PROTECTED_BRANCH_REGEX: '^dndc-'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add remotes and fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "${UPSTREAM_REMOTE}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_REMOTE}"
+          git remote add codeberg "${CODEBERG_REMOTE}" 2>/dev/null || git remote set-url codeberg "${CODEBERG_REMOTE}"
+          git fetch upstream --prune --tags '+refs/heads/*:refs/remotes/upstream/*'
+
+      - name: Configure Codeberg auth
+        env:
+          CODEBERG_USERNAME: ${{ secrets.CODEBERG_USERNAME }}
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CODEBERG_USERNAME:?missing CODEBERG_USERNAME}"
+          : "${CODEBERG_TOKEN:?missing CODEBERG_TOKEN}"
+          cat > ~/.netrc <<EOF
+          machine codeberg.org
+          login ${CODEBERG_USERNAME}
+          password ${CODEBERG_TOKEN}
+          EOF
+          chmod 600 ~/.netrc
+
+      - name: Sync main while preserving fork workflows
+        run: |
+          set -euo pipefail
+
+          rm -rf /tmp/fork-workflows
+          mkdir -p /tmp/fork-workflows
+          if [ -d .github/workflows ]; then
+            cp -a .github/workflows/. /tmp/fork-workflows/
+          fi
+
+          git checkout main
+          git reset --hard upstream/main
+
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          if [ -d /tmp/fork-workflows ] && [ -n "$(ls -A /tmp/fork-workflows 2>/dev/null || true)" ]; then
+            cp -a /tmp/fork-workflows/. .github/workflows/
+          fi
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync upstream main while preserving fork workflows"
+          fi
+
+          git push origin +HEAD:refs/heads/main
+          git push codeberg +HEAD:refs/heads/main
+
+      - name: List upstream version branches
+        id: list_versions
+        run: |
+          set -euo pipefail
+
+          version_re="${VERSION_BRANCH_REGEX}"
+          min_version="${MIN_VERSION}"
+
+          mapfile -t all_version_branches < <(
+            git for-each-ref \
+              --format='%(refname:strip=3)' \
+              refs/remotes/upstream |
+            grep -E "$version_re" |
+            sort -V
+          )
+
+          version_branches=()
+
+          for branch in "${all_version_branches[@]}"; do
+            if dpkg --compare-versions "$branch" ge "$min_version"; then
+              version_branches+=("$branch")
+            fi
+          done
+
+          echo "Detected version branches >= ${min_version}:"
+
+          if [ ${#version_branches[@]} -eq 0 ]; then
+            echo "  <none>"
+            : > /tmp/upstream_version_branches.txt
+          else
+            printf '  %s\n' "${version_branches[@]}"
+            printf '%s\n' "${version_branches[@]}" \
+              > /tmp/upstream_version_branches.txt
+          fi
+
+      - name: Sync version branches to origin (strip workflows)
+        run: |
+          set -euo pipefail
+          mapfile -t version_branches < /tmp/upstream_version_branches.txt
+          protected_re="${PROTECTED_BRANCH_REGEX}"
+
+          for branch in "${version_branches[@]}"; do
+            [[ "$branch" =~ $protected_re ]] && continue
+            echo "Syncing $branch to origin (workflows stripped)"
+
+            tmpdir="$(mktemp -d)"
+            git worktree add --detach "$tmpdir" "refs/remotes/upstream/${branch}" >/dev/null
+
+            rm -rf "$tmpdir/.github/workflows"
+
+            git -C "$tmpdir" add -A
+            if ! git -C "$tmpdir" diff --cached --quiet; then
+              git -C "$tmpdir" commit -m "Sync upstream ${branch} (remove workflows for GitHub Actions compatibility)"
+            fi
+
+            git -C "$tmpdir" push origin +HEAD:refs/heads/"${branch}"
+
+            git worktree remove --force "$tmpdir" >/dev/null 2>&1 || true
+            rm -rf "$tmpdir"
+          done
+
+      - name: Sync version branches to codeberg
+        run: |
+          set -euo pipefail
+          mapfile -t version_branches < /tmp/upstream_version_branches.txt
+          protected_re="${PROTECTED_BRANCH_REGEX}"
+          for branch in "${version_branches[@]}"; do
+            [[ "$branch" =~ $protected_re ]] && continue
+            echo "Syncing $branch to codeberg"
+            git push codeberg "+refs/remotes/upstream/${branch}:refs/heads/${branch}"
+          done
+
+      - name: Delete obsolete branches
+        run: |
+          set -euo pipefail
+
+          version_re="${VERSION_BRANCH_REGEX}"
+          protected_re="${PROTECTED_BRANCH_REGEX}"
+
+          mapfile -t upstream_versions < /tmp/upstream_version_branches.txt
+          declare -A alive_versions
+          for v in "${upstream_versions[@]}"; do
+            alive_versions["$v"]=1
+          done
+
+          prune_remote() {
+            local remote="$1"
+            echo "=== Pruning $remote ==="
+            mapfile -t branches < <(
+              git ls-remote --heads "$remote" |
+              awk '{sub(/^refs\/heads\//,"",$2); print $2}'
+            )
+            for branch in "${branches[@]}"; do
+              if [[ "$branch" == "main" ]]; then
+                echo "  [keep] $remote/$branch (main)"
+                continue
+              fi
+              if [[ "$branch" =~ $protected_re ]]; then
+                echo "  [keep] $remote/$branch (protected)"
+                continue
+              fi
+              if [[ "$branch" =~ $version_re ]]; then
+                if [[ -n "${alive_versions[$branch]:-}" ]]; then
+                  echo "  [keep] $remote/$branch (version exists upstream)"
+                  continue
+                else
+                  echo "  [delete] $remote/$branch (version vanished upstream)"
+                  git push "$remote" ":refs/heads/$branch" || true
+                  continue
+                fi
+              fi
+              echo "  [delete] $remote/$branch (non-version / stale)"
+              git push "$remote" ":refs/heads/$branch" || true
+            done
+          }
+
+          prune_remote origin
+          prune_remote codeberg
