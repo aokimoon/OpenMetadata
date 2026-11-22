@@ -62,28 +62,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf /tmp/fork-workflows
-          mkdir -p /tmp/fork-workflows
-          if [ -d .github/workflows ]; then
-            cp -a .github/workflows/. /tmp/fork-workflows/
+          git fetch origin main
+          git checkout -B main origin/main
+
+          git restore \
+            --source=upstream/main \
+            --staged --worktree \
+            -- . ':(exclude).github/workflows/**'
+
+          if ! git diff --cached --quiet -- .github/workflows/; then
+            echo "::error::Workflow modification detected"
+            exit 1
           fi
 
-          git checkout main
-          git reset --hard upstream/main
-
-          rm -rf .github/workflows
-          mkdir -p .github/workflows
-          if [ -d /tmp/fork-workflows ] && [ -n "$(ls -A /tmp/fork-workflows 2>/dev/null || true)" ]; then
-            cp -a /tmp/fork-workflows/. .github/workflows/
-          fi
-
-          git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "Sync upstream main while preserving fork workflows"
+            git commit -m "Sync upstream main"
+            git push origin HEAD:refs/heads/main
           fi
 
-          git push origin +HEAD:refs/heads/main
-          git push codeberg +refs/remotes/upstream/main:refs/heads/main
+          git push codeberg \
+            +refs/remotes/upstream/main:refs/heads/main
 
       - name: List upstream version branches
         id: list_versions
